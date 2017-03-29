@@ -201,6 +201,8 @@ IF( ROOT_CONFIG_EXECUTABLE )
 
         ENDFOREACH()
 
+	LIST( APPEND _root_libnames Unfold )
+
     ENDIF()
 
 
