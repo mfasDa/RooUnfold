@@ -26,7 +26,9 @@
 #include <assert.h>
 #include <cmath>
 
+#include "TBrowser.h"
 #include "TClass.h"
+#include "TCollection.h"
 #include "TNamed.h"
 #include "TH1.h"
 #include "TH2.h"
@@ -128,6 +130,27 @@ void RooUnfoldResponse::Add(const RooUnfoldResponse& rhs) {
 	_fak->Add(rhs._fak);
 	_tru->Add(rhs._tru);
 	_res->Add(rhs._res);
+}
+
+Long64_t RooUnfoldResponse::Merge(TCollection *coll){
+   if (coll) {
+      RooUnfoldResponse *other(0);
+      TIter iter(coll);
+      while (other = static_cast<RooUnfoldResponse *>(iter())) {
+         // Add other RooUnfold response to this
+         Add(*other);
+      }
+   }
+   return coll->GetEntries() + 1;
+}
+
+void RooUnfoldResponse::Browse(TBrowser *b)
+{
+
+	if(_mes) b->Add(_mes, "Measured");
+	if(_fak) b->Add(_fak, "Fakes");
+	if(_tru) b->Add(_tru, "True");
+	if(_res) b->Add(_res, "Response");
 }
 
 RooUnfoldResponse&
