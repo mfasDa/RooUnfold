@@ -132,11 +132,32 @@ MACRO( GEN_ROOT_DICT_SOURCE _dict_src_filename )
           COMMENT "generating: ${_dict_src_file} ${_dict_hdr_file}"
       )
     ELSE()
+      SET(HEADERS "")
+      SET(INCPATH "")
+      foreach(hdr ${ROOT_DICT_INPUT_HEADERS})
+        string(FIND "${hdr}" "/" _idx REVERSE)
+        if(_idx GREATER -1)
+            # Has a subdirectory specified
+            get_filename_component(_itmdir "${hdr}" DIRECTORY)
+            get_filename_component(_itmbase "${hdr}" NAME)
+            list(APPEND HEADERS "${_itmbase}")
+            STRING(FIND  "${INCPATH}" "${_itmdir}" _jdx)
+            if(_jdx LESS 0)
+                SET(INCPATH -I${_itmdir} ${INCPATH})
+            endif()
+        else()
+            # No subdirectory specified
+            list(APPEND HEADERS "${_itm}")
+        endif()
+      endforeach(hdr ${ROOT_DICT_INPUT_HEADERS})
+      MESSAGE(STATUS "INCPATH ${INCPATH}")
+      MESSAGE(STATUS "HEADERS ${HEADERS}")
+    
       STRING(REPLACE ".cxx" "_rdict.pcm" _dict_pcm_file ${_dict_src_file})
       ADD_CUSTOM_COMMAND(
           OUTPUT  ${_dict_src_file} ${_dict_hdr_file} ${CMAKE_CURRENT_BINARY_DIR}/libRooUnfold.rootmap ${_dict_pcm_file}
           COMMAND mkdir -p ${ROOT_DICT_OUTPUT_DIR}
-          COMMAND ${ROOT_CINT_WRAPPER} -f "${_dict_src_file}" -rmf ${CMAKE_CURRENT_BINARY_DIR}/libRooUnfold.rootmap -rml libRooUnfold -c -p ${ROOT_DICT_CINT_DEFINITIONS} ${_dict_includes} ${ROOT_DICT_INPUT_HEADERS}
+          COMMAND ${ROOT_CINT_WRAPPER} -f "${_dict_src_file}" -rmf ${CMAKE_CURRENT_BINARY_DIR}/libRooUnfold.rootmap -rml libRooUnfold -c -p ${ROOT_DICT_CINT_DEFINITIONS} ${_dict_includes} ${INCPATH} ${HEADERS}
           WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
           DEPENDS ${ROOT_DICT_INPUT_HEADERS}
           COMMENT "generating: ${_dict_src_file} ${_dict_hdr_file} and PCH/rootmap file"
