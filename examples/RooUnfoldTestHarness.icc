@@ -20,6 +20,7 @@
 #endif
 
 #include <cfloat>
+#include <algorithm>
 #if !defined(__CINT__) || defined(__MAKECINT__)
 #include <iostream>
 
@@ -32,16 +33,16 @@
 #include "TPostScript.h"
 #include "TH1D.h"
 #include "TH2D.h"
+#include "TF1.h"
 #include "TFile.h"
 #include "TVectorD.h"
 #include "TLine.h"
 #include "TNtuple.h"
 #include "TProfile.h"
-#include "../include/RooUnfoldErrors.h"
-#include "../include/RooUnfoldParms.h"
-#include "../include/RooUnfoldResponse.h"
-#include "../include/RooUnfold.h"
-#include "../include/RooUnfoldSvd.h"
+#include "RooUnfoldErrors.h"
+#include "RooUnfoldParms.h"
+#include "RooUnfoldResponse.h"
+#include "RooUnfold.h"
 #ifdef USE_TUNFOLD_H
 #include "RooUnfoldTUnfold.h"
 #endif
@@ -56,6 +57,7 @@
 
 #ifdef USE_ROOFIT
 #include "RooUnfoldTestPdfRooFit.icc"
+#include "RooRandom.h"
 #else
 #include "RooUnfoldTestPdf.icc"
 #endif
@@ -72,14 +74,15 @@ using std::endl;
 
 void RooUnfoldTestHarness::Parms (ArgVars& args)
 {
-  TString methodHelp, methodHelp2;  // TString::Form seems to be limited to 4 parameters in CINT.
+  TString methodHelp, methodHelp2, stageHelp;  // TString::Form seems to be limited to 4 parameters in CINT.
   methodHelp.Form ("unfolding method: %d=none, %d=Bayes, %d=SVD, ",
                    RooUnfold::kNone,     RooUnfold::kBayes,   RooUnfold::kSVD);
-  methodHelp2.Form("%d=bin-by-bin, %d=TUnfold, %d=invert",
-                   RooUnfold::kBinByBin, RooUnfold::kTUnfold, RooUnfold::kInvert);
+  methodHelp2.Form("%d=bin-by-bin, %d=TUnfold, %d=invert, %d=IDS",
+                   RooUnfold::kBinByBin, RooUnfold::kTUnfold, RooUnfold::kInvert, RooUnfold::kIDS);
   methodHelp += methodHelp2;
+  stageHelp.Form ("1=train (writes %s.root), 2=test (reads), 0=both (default)", GetName());
   args.Add ("method",  &method,       RooUnfold::kBayes, methodHelp.Data());
-  args.Add ("stage",   &stage,        0, "1=train (writes RooUnfoldTest.root), 2=test (reads), 0=both (default)");
+  args.Add ("stage",   &stage,        0, stageHelp.Data());
   args.Add ("ftrainx", &ftrainx,      0, "training X PDF: 0=flat, 1=top-hat, 2=Gaussian, 3=double exp, 4=B-W, 5=double B-W, 6=exp, 7=Gaussian+exp");
   args.Add ("ftestx",  &ftestx,       5, "test X PDF");
   args.Add ("ntx",     &ntx,         40, "#truth X bins");
@@ -88,13 +91,13 @@ void RooUnfoldTestHarness::Parms (ArgVars& args)
   args.Add ("xlo",     &xlo,        0.0, "X range minimum");
   args.Add ("xhi",     &xhi,       10.0, "X range maximum");
   args.Add ("regparm", &regparm,  -1e30, "regularisation parameter (default: Bayes niter=3, SVD kterm=ntx/2)", "");
-  args.Add ("ntoyssvd",&ntoyssvd,  1000, "number of toys used to obtain SVD covariances");
 #ifdef USE_TUNFOLD_H
   args.Add ("regmethod",&regmethod,   2, "TUnfold regularisation method (0=none, 1=size, 2=derivative, 3=curvature)");
 #endif
   args.Add ("onepage", &onepage,      4, "number of plots to include on the page, or 0 for all plots on separate pages");
   args.Add ("doerror", &doerror,      RooUnfold::kCovariance,
                                          "error treatment (0=none, 1=error propagation, 2=covariance propagation, 3=toy MC)");
+  args.Add ("dosys",   &dosys,        0, "include systematic errors from response matrix: 0=stat only, 1=stat+sys, 2=sys only");
   args.Add ("nmx",     &nmx,         -1, "#measured X bins", "ntx");
   args.Add ("mtrainx", &mtrainx,    5.0, "training signal PDF X mean");
   args.Add ("wtrainx", &wtrainx,    1.2, "training signal PDF X width");
@@ -102,12 +105,14 @@ void RooUnfoldTestHarness::Parms (ArgVars& args)
   args.Add ("mtestx",  &mtestx,     5.5, "test signal PDF X mean");
   args.Add ("wtestx",  &wtestx,     1.0, "test signal PDF X width");
   args.Add ("btestx",  &btestx,     0.3, "test X PDF background fraction");
+  args.Add ("doeff",   &doeff,        1, "include efficiencies in the response model");
   args.Add ("effxlo",  &effxlo,     0.5, "efficiency at xlo");
   args.Add ("effxhi",  &effxhi,     0.9, "efficiency at xhi");
   args.Add ("xbias",   &xbias,     -1.0, "shift in X");
   args.Add ("xsmear",  &xsmear,     0.5, "X smearing width in bins");
-  args.Add ("fakexlo", &fakexlo,    0.0, "fraction of fakes at xlo");
-  args.Add ("fakexhi", &fakexhi,    0.0, "fraction of fakes at xhi");
+  args.Add ("addfakes",&addfakes,     0, "include fakes in the response model");
+  args.Add ("fakexlo", &fakexlo,    0.2, "fraction of fakes at xlo");
+  args.Add ("fakexhi", &fakexhi,    0.5, "fraction of fakes at xhi");
   args.Add ("bincorr", &bincorr,    0.0, "correlation between neighbouring measured bins");
   args.Add ("overflow",&overflow,     0, "0=unfolding ignores under/overflow bins, 1=unfolding uses under/overflow bins, 2=fill under/overflows into first/last bins");
   args.Add ("addbias", &addbias,     -1, "apply systematic shift/rotation (disabled by default for bin-by-bin/invert methods)", "1");
@@ -116,11 +121,14 @@ void RooUnfoldTestHarness::Parms (ArgVars& args)
   args.Add ("verbose", &verbose,      1, "debug level: 0=warnings, 1=verbose, 2=debug, 3=detailed");
   args.Add ("draw",    &dodraw,       1, "draw results");
   args.Add ("ntoys",   &ntoys,       -1, "number of toys for error calculation (doerror=3) or plots (ploterrors=1, default ntoys=500)", "50");
-  args.Add ("ploterrors",&ploterrors, 0, "plot error comparison and chi2?");
+  args.Add ("ploterrors",&ploterrors, 0, "plot error comparison (ploterrors=1) and chi2 (ploterrors=2)?");
   args.Add ("plotparms",&plotparms,   0, "plot errors for different regularisation parameters?");
   args.Add ("minparm", &minparm,  -1e30, "minimum value in regparm scan (with plotparms=1)", "");
   args.Add ("maxparm", &maxparm,  -1e30, "maximum value in regparm scan (with plotparms=1)", "");
   args.Add ("stepsize",&stepsize,     0, "step size in regparm scan (with plotparms=1)", "");
+  args.Add ("name",    &setname, GetName(), "name for output files (name.root and name.ps)");
+  args.Add ("seed",    &seed,        -1, "random number seed for test distributions and RooUnfold toy error calculation (use seed=0 for a different seed on each run)", "");
+  args.Add ("fit",     &dofit,        0, "parametric fit of folded function to measured distribution");
 }
 
 //==============================================================================
@@ -142,7 +150,7 @@ Int_t RooUnfoldTestHarness::Run()
   TFile f (rootfile, "update");
   const TNamed* objs[] = { unfold, hTrain, hTrainTrue, hTrainFake, hTrue, hMeas, hFake,
                            hReco, hRes, hPulls, hPDFx, hTestPDFx,
-                           hResmat, hCorr, hMeasCorr, hUnfErr, hToyErr, ntChi2,
+                           hResmat, hCorr, hMeasCorr, hUnfErr, hToyErr, fitFunc, trueFunc, ntChi2,
                            hParmChi2, hParmErr, hParmRes, hParmRms };
   for (size_t i= 0; i<sizeof(objs)/sizeof(objs[0]); i++) {
     if (objs[i]) f.WriteTObject (objs[i], objs[i]->GetName());
@@ -224,9 +232,11 @@ Int_t RooUnfoldTestHarness::RunTests()
     if (!Test())   return 6;
     if (verbose>=0) cout << "==================================== UNFOLD ===================================" << endl;
     if (!Unfold()) {
+      if (dofit) Fit();
       if (dodraw) Results();
       return 7;
     }
+    if (dofit) Fit();
     if (dodraw) {
       if (!plotparms){
         if (stage == 0) TrainResults();
@@ -263,7 +273,7 @@ Int_t RooUnfoldTestHarness::Train()
     hTrainTrue->Fill (xto);
     if (Eff (xt, xlo, xhi, effxlo, effxhi)) {    
       Double_t x=  Smear   (xt, ntx, xlo, xhi, xbias, xsmear);
-      Double_t xo= Overflow (x, ntx, xlo, xhi);
+      Double_t xo= Overflow (x, nmx, xlo, xhi);
       hTrain  ->Fill (xo);
       hResmat ->Fill (xo, xto);
       response->Fill (xo, xto);
@@ -287,15 +297,16 @@ Int_t RooUnfoldTestHarness::Train()
   // or:  response->Setup (hTrain, hTrainTrue, hResmat);
   // or:  response->Setup (0, 0, hResmat);     // if no inefficiency or fakes
 
-  if (verbose>=2) PrintMatrix(response->Mresponse(),"","response matrix",10);
+  if (verbose>=2) response->Print();
   return 1;
 }
 
 void RooUnfoldTestHarness::TrainResults()
 {
   if (mscalex!=1.0) {
-    hTrain->Scale(mscalex);
-    if (hTrainFake) hTrainFake->Scale(mscalex);
+    // should really use Sumw2() for these, but we don't show errors
+    hTrain->Scale(mscalex,"nosw2");
+    if (hTrainFake) hTrainFake->Scale(mscalex,"nosw2");
   }
   setmax (hTrainTrue, hPDFx, hTrain, hTrainFake);
 
@@ -329,7 +340,7 @@ Int_t RooUnfoldTestHarness::Test()
     hTrue->Fill(xto);
     if (Eff (xt, xlo, xhi, effxlo, effxhi)) {
       Double_t x = Smear   (xt, ntx, xlo, xhi, xbias, xsmear);
-      Double_t xo= Overflow (x, ntx, xlo, xhi);
+      Double_t xo= Overflow (x, nmx, xlo, xhi);
       hMeas->Fill(xo);
     }
   }
@@ -356,12 +367,14 @@ void RooUnfoldTestHarness::SetMeasuredCov ()
 {
   if (bincorr==0.0) return;
   TMatrixD cov= unfold->GetMeasuredCov();  // initially diagonal
-  Double_t corr= bincorr;
-  for (Int_t k=1; k<nmbins; k++) {
-    for (Int_t i=k; i<nmbins; i++)
-      cov(i,i-k)= cov(i-k,i)= corr*cov(i,i);
-    corr *= bincorr;
-    if (corr==0.0) break;
+  if (bincorr!=999.0) {    // use bincorr=999 to test with truely diagonal matrix
+    Double_t corr= bincorr;
+    for (Int_t k=1; k<nmbins; k++) {
+      for (Int_t i=k; i<nmbins; i++)
+        cov(i,i-k)= cov(i-k,i)= corr*cov(i,i);
+      corr *= bincorr;
+      if (corr==0.0) break;
+    }
   }
   unfold->SetMeasuredCov (cov);
   hMeasCorr= CorrelationHist (cov, "measCor", "Measured correlation matrix",
@@ -381,9 +394,9 @@ Int_t RooUnfoldTestHarness::Unfold ()
   unfold->SetVerbose (verbose);
   if (ntoys<0) ntoys= (ploterrors) ? 500 : 50;
   unfold->SetNToys(ntoys);
+  unfold->IncludeSystematics(dosys);
   SetMeasuredCov();
   
-  if (method == RooUnfold::kSVD)     (dynamic_cast<RooUnfoldSvd*    >(unfold))->SetNtoysSVD(ntoyssvd);
 #ifdef USE_TUNFOLD_H
   if (method == RooUnfold::kTUnfold) (dynamic_cast<RooUnfoldTUnfold*>(unfold))->SetRegMethod((TUnfold::ERegMode)regmethod);
 #endif
@@ -399,7 +412,7 @@ Int_t RooUnfoldTestHarness::Unfold ()
     for (Int_t i=0; i<ntbins; i++)
       for (Int_t j=0; j<ntbins; j++)
         errmat(i,j)= covmat(i,j)>=0 ? sqrt(covmat(i,j)) : -sqrt(-covmat(i,j));
-    PrintMatrix(errmat,"","covariance matrix",10);
+    RooUnfoldResponse::PrintMatrix(errmat,"covariance matrix");
   }
 
   // Calculate pulls and residuals
@@ -438,8 +451,10 @@ Int_t RooUnfoldTestHarness::Unfold ()
 void RooUnfoldTestHarness::Results()
 {
   if (mscalex!=1.0) {
-    hMeas->Scale(mscalex);
-    if (hFake) hFake->Scale(mscalex);
+    // should really use Sumw2() for these, but we don't show errors
+    hMeas->Scale(mscalex,"nosw2");
+    if (hFake) hFake->Scale(mscalex,"nosw2");
+    if (fitFunc) fitFunc->GetHistogram()->Scale(mscalex,"nosw2");
   }
   setmax (hTrue, hTestPDFx, hMeas, hFake);
   if (hReco) {
@@ -451,10 +466,12 @@ void RooUnfoldTestHarness::Results()
   if (onepage) canvas->cd(++ipad);
   hTrue    ->Draw();
   hTestPDFx->Draw("LSAME");
+  if (fitFunc)   fitFunc->GetHistogram()->Draw("SAME");
+  if (trueFunc) trueFunc->Draw("LSAME");
   hMeas    ->Draw("SAME");
   if (hFake) hFake->Draw("SAME");
   if (hReco) hReco->Draw("SAME P");
-  Legend (lTest, hTestPDFx, hTrue, hFake, hMeas, hReco);
+  Legend (lTest, hTestPDFx, hTrue, hFake, hMeas, hReco, fitFunc, trueFunc);
   canvas->Update();
 
   if (!hReco)        return;
@@ -563,6 +580,146 @@ void RooUnfoldTestHarness::PlotParms()
   canvas->Update();
 }
 
+//==============================================================================
+// Parametric Fit - an alternative to unfolding
+//==============================================================================
+
+TF1* RooUnfoldTestHarness::FitFunc (Int_t fpdf, TH1* h, Double_t mean, Double_t width, Double_t bkg)
+{
+  // Implement PDFs as TF1 functions. These should match the functions defined in
+  // RooUnfoldTestPdf.icc or RooUnfoldTestPdfRooFit.icc.
+  static const Double_t pi= atan2 (0.0, -1.0);
+  if (bkg<0.0) bkg= 0.0;
+  if (bkg>1.0) bkg= 1.0;
+  if (fpdf==0) bkg= 0.0;
+
+  Int_t nb= h->GetNbinsX();
+  const Double_t nx= h->GetEntries(), xlo= h->GetXaxis()->GetXmin(), xhi= h->GetXaxis()->GetXmax();
+  const Double_t xwidth= xhi-xlo, unorm= nx * (xwidth / nb);
+  const Double_t norm= unorm*(1.0-bkg), bnorm= unorm*bkg/xwidth;
+
+  TF1* f=0;
+  switch (fpdf) {
+
+    case 0: {
+      f= new TF1 ("trueFunc", "[0]", xlo, xhi);
+      f->SetParameters (0, norm / xwidth);
+      break;
+    }
+
+    case 1: {
+      const Double_t fnorm= norm / (6.0*width), xw=0.1*xwidth/nb;
+      // Fit can't cope with a pure step function, so add a slope
+      f= new TF1 ("trueFunc",
+                  Form("[0]*(ROOT::Math::gaussian_cdf((x-[2]+[3])/(%g)) - ROOT::Math::gaussian_cdf((x-[2]-[3])/(%g))) + [1]",xw,xw),
+                  xlo, xhi);
+      f->SetParNames   ("norm", "bkg", "low", "width");
+      f->SetParameters (fnorm, bnorm, mean, 3.0*width);
+      f->SetParLimits (0, 0.0, 10.0*fnorm);
+      f->SetParLimits (1, 0.0, 10.0*bnorm);
+      f->SetParLimits (2, xlo, xhi);
+      f->SetParLimits (3, 0.0, xhi-xlo);
+      break;
+    }
+
+    case 2: {
+      const Double_t fnorm= norm / (sqrt(2*pi) * width);
+      f= new TF1 ("trueFunc", "[0]*exp(-0.5*((x-[2])/[3])**2) + [1]", xlo, xhi);
+      f->SetParNames   ("norm", "bkg", "mean", "width");
+      f->SetParameters (fnorm, bnorm, mean, width);
+      f->SetParLimits (0, 0.0, 10.0*fnorm);
+      f->SetParLimits (1, 0.0, 10.0*bnorm);
+      f->SetParLimits (2, xlo, xhi);
+      f->SetParLimits (3, 0.0, 5.0*(xhi-xlo));
+      break;
+    }
+
+    case 3: {
+      const Double_t fnorm= norm / (2.0*width);
+      f= new TF1 ("trueFunc", "[0]*exp(-abs(x-[2])/[3]) + [1]", xlo, xhi);
+      f->SetParNames   ("norm", "bkg", "mean", "width");
+      f->SetParameters (fnorm, bnorm, mean, width);
+      f->SetParLimits (0, 0.0, 10.0*fnorm);
+      f->SetParLimits (1, 0.0, 10.0*bnorm);
+      f->SetParLimits (2, xlo, xhi);
+      f->SetParLimits (3, 0.0, 5.0*(xhi-xlo));
+      break;
+    }
+
+    case 4: {
+      const Double_t fnorm= norm * width / (2*pi);
+      f= new TF1 ("trueFunc", "[0]/((x-[2])**2+0.25*[3]**2) + [1]", xlo, xhi);
+      f->SetParNames   ("norm", "bkg", "mean", "width");
+      f->SetParameters (fnorm, bnorm, mean, width);
+      f->SetParLimits (0, 0.0, 10.0*fnorm);
+      f->SetParLimits (1, 0.0, 10.0*bnorm);
+      f->SetParLimits (2, xlo, xhi);
+      f->SetParLimits (3, 0.0, 5.0*(xhi-xlo));
+      break;
+    }
+
+    case 5: {
+      const Double_t fnorm= norm * width / (4*pi);
+      f= new TF1 ("trueFunc", "[0]*(1.0/((x-[2])**2+0.25*[4]**2) + 1.0/((x-[3])**2+0.25*[4]**2)) + [1]", xlo, xhi);
+      f->SetParNames   ("norm", "bkg", "mean1", "mean2", "width");
+      f->SetParameters (fnorm, bnorm, mean-width, mean+width, width);
+      f->SetParLimits (0, 0.0, 10.0*fnorm);
+      f->SetParLimits (1, 0.0, 10.0*bnorm);
+      f->SetParLimits (2, xlo, xhi);
+      f->SetParLimits (3, xlo, xhi);
+      f->SetParLimits (4, 0.0, 5.0*(xhi-xlo));
+      break;
+    }
+
+    case 6: {
+      const Double_t tau = mean-xlo;
+      const Double_t fnorm= norm / (tau * (exp(-xlo/tau) - exp(-xhi/tau)));
+      f= new TF1 ("trueFunc", "[0]*exp(-x/[2]) + [1]", xlo, xhi);
+      f->SetParNames   ("norm", "bkg", "tau");
+      f->SetParameters (fnorm, bnorm, tau);
+      f->SetParLimits (0, 0.0, 10.0*fnorm);
+      f->SetParLimits (1, 0.0, 10.0*bnorm);
+      f->SetParLimits (2, 0.0, 10.0*tau);
+      break;
+    }
+
+    case 7: {
+      const Double_t tau     = mean-xlo;
+      const Double_t mywidth = width/4.0;
+      const Double_t fexp    = 0.9;
+      const Double_t rnorm= norm / (sqrt(2*pi) * mywidth);
+      const Double_t enorm= norm / (tau * (exp(-xlo/tau) - exp(-xhi/tau)));
+      f= new TF1 ("trueFunc", "[0]*exp(-0.5*((x-[3])/[4])**2) + [2]*exp(-x/[5]) + [1]", xlo, xhi);
+      f->SetParNames   ("G-norm", "bkg", "E-norm", "mean", "width", "tau");
+      f->SetParameters ((1.0-fexp)*rnorm, bnorm, fexp*enorm, mean, width, tau);
+      f->SetParLimits (0, 0.0, 10.0*rnorm);
+      f->SetParLimits (1, 0.0, 10.0*enorm);
+      f->SetParLimits (2, 0.0, 10.0*bnorm);
+      f->SetParLimits (3, xlo, xhi);
+      f->SetParLimits (4, 0.0, 5.0*(xhi-xlo));
+      f->SetParLimits (5, 0.0, 10.0*tau);
+      break;
+    }
+
+    default:
+      cerr << "PDF " << fpdf << " not defined" << endl;
+  }
+  //  if (f) f->Print();
+  return f;
+}
+
+
+void RooUnfoldTestHarness::Fit ()
+{
+  trueFunc= FitFunc (ftestx, hTrue, mtestx+0.3, wtestx*1.4, btestx*0.7); // add some fudge to challenge fit
+  if (!trueFunc) return;
+  trueFunc->SetLineColor(kGreen+3);
+  trueFunc->SetNpx(std::max(10*ntbins,100));
+  fitFunc= response->MakeFoldingFunction (trueFunc, 1e-12, verbose>=3);
+  if (!fitFunc) return;
+  fitFunc->SetLineColor(800);
+  hMeas->Fit (fitFunc, (verbose>=2 ? "NV" : verbose>=1 ? "N" : "NQ"));
+}
 
 //==============================================================================
 // Generate PDF using RooUnfoldTestPdf
@@ -584,7 +741,7 @@ TH1D* RooUnfoldTestHarness::Generate (TVectorD& x, const char* name, const char*
   }
   if (verbose >= 1) cout << "Generate values in range " << lo << " to " << hi << endl;
   if (!RooUnfoldTestPdf (fpdf, nx, lo, hi, x, hPDF, mean, width, bkg, verbose)) return 0;
-  hPDF->Scale (nbPDF/Double_t(nt));
+  hPDF->Scale (nbPDF/Double_t(nt), "nosw2");
   return hPDF;
 }
 
@@ -594,7 +751,7 @@ TH1D* RooUnfoldTestHarness::Generate (TVectorD& x, const char* name, const char*
 
 Int_t RooUnfoldTestHarness::Fakes (TVectorD& x, Int_t nm, Int_t nx, Double_t x0, Double_t x1, Double_t y0, Double_t y1) const
 {
-  if (y0<=0.0 && y1<=0.0) return 0;
+  if (!addfakes || (y0<=0.0 && y1<=0.0)) return 0;
   if (overflow == 1) {
     // Fill under/overflow bins too
     Double_t xw= x1-x0;
@@ -673,7 +830,7 @@ bool RooUnfoldTestHarness::Eff (Double_t x, Double_t lo, Double_t hi, Double_t e
 {
   // Apply an efficiency function to the truth.
   // Efficiency: 30% at x=lo, 90% at x=hi.
-
+  if (!doeff || (efflo>=1.0 && effhi>=1.0)) return true;
   Double_t xwidth =  (hi-lo);
   Double_t slope = (effhi-efflo) / xwidth;
   Double_t yeff= (efflo + slope * (x-lo));  // efficiency
@@ -703,11 +860,11 @@ Double_t RooUnfoldTestHarness::Smear (Double_t x, Int_t nt, Double_t lo, Double_
 
 }
 
-Double_t RooUnfoldTestHarness::Overflow (Double_t x, Int_t nt, Double_t lo, Double_t hi) const
+Double_t RooUnfoldTestHarness::Overflow (Double_t x, Int_t nb, Double_t lo, Double_t hi) const
 {
   if (overflow!=2)    return x;
-  else if   (x < lo)  return lo + (hi-lo) / Double_t(2*nt);
-  else if (!(x < hi)) return hi - (hi-lo) / Double_t(2*nt);
+  else if   (x < lo)  return lo + (hi-lo) / Double_t(2*nb);
+  else if (!(x < hi)) return hi - (hi-lo) / Double_t(2*nb);
   else return x;
 }
 
@@ -763,6 +920,7 @@ void RooUnfoldTestHarness::Reset()
   hTrain= hTrainTrue= hTrainFake= hTrue= hMeas= hFake= hReco= hRes= hPulls=
     hUnfErr= hToyErr= hParmChi2= hParmErr= hParmRes= hParmRms= 0;
   hResmat= hCorr= hMeasCorr= 0;
+  fitFunc= trueFunc= 0;
   ntChi2= 0;
   lTrain= lTest= lErrors= 0;
   error= ipad= 0;
@@ -787,6 +945,7 @@ int RooUnfoldTestHarness::SetArgs (int argc, const char* const* argv, bool split
 
 void RooUnfoldTestHarness::Init()
 {
+  if (setname.Length()>0) SetName (setname);
   rootfile= GetName();
   rootfile += ".root";
 
@@ -796,7 +955,7 @@ void RooUnfoldTestHarness::Init()
     xlo -= xwid;
     xhi += xwid;
     ntx += 2;
-    nmx += Int_t (2.0*(Double_t(nmx)/Double_t(ntx)) + 0.5);
+    nmx += 2;
   }
   mscalex= (nmx==ntx) ? 1.0 : Double_t(nmx)/Double_t(ntx);
   ntbins= ntx;
@@ -806,6 +965,13 @@ void RooUnfoldTestHarness::Init()
   } else {
     if (wpaper==0) wpaper= 750;
     if (hpaper==0) hpaper= 300;
+  }
+
+  if (seed>=0) {
+    gRandom->SetSeed(seed);   // seed=0, uses a unique (UUID) seed each job (see TRandom3::SetSeed)
+#ifdef USE_ROOFIT
+    RooRandom::randomGenerator()->SetSeed(seed ? seed+8243 : 0);
+#endif
   }
 }
 
@@ -850,9 +1016,9 @@ TH2D* RooUnfoldTestHarness::CorrelationHist (const TMatrixD& cov,
   return h;
 }
 
-void RooUnfoldTestHarness::Legend (TLegend*& legend, TH1* pdf, TH1* truth, TH1* fake, TH1* meas, TH1* reco)
+void RooUnfoldTestHarness::Legend (TLegend*& legend, TH1* pdf, TH1* truth, TH1* fake, TH1* meas, TH1* reco, TF1* ff, TF1* tf)
 {
-  legend= new TLegend (0.79, (reco ? 0.72 : 0.75), 0.894, 0.89);
+  legend= new TLegend (0.79, (tf ? 0.62 : reco ? 0.72 : 0.75), 0.894, 0.89);
   legend->SetTextSize(0.035);
   legend->SetTextFont(42);
   legend->AddEntry (pdf,   "PDF",           "L");
@@ -862,65 +1028,11 @@ void RooUnfoldTestHarness::Legend (TLegend*& legend, TH1* pdf, TH1* truth, TH1* 
   legend->AddEntry (meas,  "measured",      "L");
   if (reco)
   legend->AddEntry (reco,  "reconstructed", "P");
+  if (ff)
+  legend->AddEntry (ff->GetHistogram(), "measured fit", "L");
+  if (tf)
+  legend->AddEntry (tf,    "truth fit",     "L");
   legend->Draw();
-}
-
-void RooUnfoldTestHarness::PrintMatrix(const TMatrixD& m, const char* format,
-                                       const char* name, Int_t cols_per_sheet)
-{
-   // Print the matrix as a table of elements.
-   // Based on TMatrixTBase<>::Print, but allowing user to specify name and cols_per_sheet (also option -> format).
-   // By default the format "%11.4g" is used to print one element.
-   // One can specify an alternative format with eg
-   //  format ="%6.2f  "
-
-   if (!m.IsValid()) {
-     m.Error("PrintMatrix","%s is invalid",name);
-     return;
-   }
-
-   const Int_t ncols  = m.GetNcols();
-   const Int_t nrows  = m.GetNrows();
-   const Int_t collwb = m.GetColLwb();
-   const Int_t rowlwb = m.GetRowLwb();
-
-   if (!(format && format[0])) format= "%11.4g ";
-   char topbar[1000];
-   snprintf(topbar,1000,format,123.456789);
-   Int_t nch = strlen(topbar)+1;
-   if (nch > 18) nch = 18;
-   char ftopbar[20];
-   for (Int_t i = 0; i < nch; i++) ftopbar[i] = ' ';
-   Int_t nk = 1 + Int_t(log10(ncols));
-   snprintf(ftopbar+nch/2,20-nch/2,"%s%dd","%",nk);
-   Int_t nch2 = strlen(ftopbar);
-   for (Int_t i = nch2; i < nch; i++) ftopbar[i] = ' ';
-   ftopbar[nch] = '|';
-   ftopbar[nch+1] = 0;
-
-   printf("\n%dx%d %s is as follows",nrows,ncols,name);
-
-   if (cols_per_sheet <= 0) {
-     cols_per_sheet = 5;
-     if (nch <= 8) cols_per_sheet =10;
-   }
-   nk = 5+nch*(cols_per_sheet<ncols ? cols_per_sheet : ncols);
-   for (Int_t i = 0; i < nk; i++) topbar[i] = '-';
-   topbar[nk] = 0;
-   for (Int_t sheet_counter = 1; sheet_counter <= ncols; sheet_counter += cols_per_sheet) {
-      printf("\n\n     |");
-      for (Int_t j = sheet_counter; j < sheet_counter+cols_per_sheet && j <= ncols; j++)
-         printf(ftopbar,j+collwb-1);
-      printf("\n%s\n",topbar);
-      if (m.GetNoElements() <= 0) continue;
-      for (Int_t i = 1; i <= nrows; i++) {
-         printf("%4d |",i+rowlwb-1);
-         for (Int_t j = sheet_counter; j < sheet_counter+cols_per_sheet && j <= ncols; j++)
-            printf(format,m(i+rowlwb-1,j+collwb-1));
-         printf("\n");
-      }
-   }
-   printf("\n");
 }
 
 //==============================================================================

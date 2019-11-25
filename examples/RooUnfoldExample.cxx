@@ -9,18 +9,21 @@
 //
 //==============================================================================
 
-#if !defined(__CINT__) || defined(__MAKECINT__)
+#if !(defined(__CINT__) || defined(__CLING__)) || defined(__ACLIC__)
 #include <iostream>
+#include <string>
 using std::cout;
 using std::endl;
 
 #include "TRandom.h"
 #include "TH1D.h"
+#include "TCanvas.h"
 
-#include "../include/RooUnfoldResponse.h"
-#include "../include/RooUnfoldBayes.h"
-//#include "RooUnfoldSvd.h"
-//#include "RooUnfoldTUnfold.h"
+#include "RooUnfoldResponse.h"
+#include "RooUnfoldBayes.h"
+#include "RooUnfoldSvd.h"
+#include "RooUnfoldTUnfold.h"
+#include "RooUnfoldIds.h"
 #endif
 
 //==============================================================================
@@ -46,12 +49,8 @@ Double_t smear (Double_t xt)
 // Example Unfolding
 //==============================================================================
 
-void RooUnfoldExample()
+void RooUnfoldExample(const char *unfolder = "bayes")
 {
-#ifdef __CINT__
-  gSystem->Load("libRooUnfold");
-#endif
-
   cout << "==================================== TRAIN ====================================" << endl;
   RooUnfoldResponse response (40, -10.0, 10.0);
 
@@ -76,19 +75,36 @@ void RooUnfoldExample()
   }
 
   cout << "==================================== UNFOLD ===================================" << endl;
-  RooUnfoldBayes   unfold (&response, hMeas, 4);    // OR
-//RooUnfoldSvd     unfold (&response, hMeas, 20);   // OR
-//RooUnfoldTUnfold unfold (&response, hMeas);
+  RooUnfold *unfold;
+  std::string unfoldername(unfolder);
+  if (unfoldername == "bayes") 
+    unfold = new RooUnfoldBayes(&response, hMeas, 4);    // OR
+  else if (unfoldername == "svd")
+    unfold = new RooUnfoldSvd(&response, hMeas, 20);   // OR
+  else if (unfoldername == "tunfold")
+    unfold = new RooUnfoldTUnfold(&response, hMeas);       // OR
+  else if (unfoldername == "ids")
+    unfold = new RooUnfoldIds(&response, hMeas, 1);
 
-  TH1D* hReco= (TH1D*) unfold.Hreco();
+  TH1D* hReco= (TH1D*) unfold->Hreco();
 
-  unfold.PrintTable (cout, hTrue);
+  TCanvas* c1= new TCanvas("canvas","canvas");
+
+  unfold->PrintTable (cout, hTrue);
   hReco->Draw();
   hMeas->Draw("SAME");
   hTrue->SetLineColor(8);
   hTrue->Draw("SAME");
+
+  c1->SaveAs(Form("RooUnfoldExample_%s.pdf", unfolder));
+
 }
 
 #ifndef __CINT__
-int main () { RooUnfoldExample(); return 0; }  // Main program when run stand-alone
+int main (int argc, const char **argv) { 
+  std::string unfolder = "bayes";
+  if(argc > 1) unfolder = argv[1];
+  RooUnfoldExample(unfolder.c_str()); 
+  return 0; 
+}  // Main program when run stand-alone
 #endif

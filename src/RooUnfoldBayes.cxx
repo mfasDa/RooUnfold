@@ -10,21 +10,23 @@
 //==============================================================================
 
 //____________________________________________________________
-/* BEGIN_HTML
-<p>Links to the RooUnfoldBayesImpl class which uses Bayesian unfolding to reconstruct the truth distribution.</p>
+/*! \class RooUnfoldBayes 
+  \brief Links to the RooUnfoldBayesImpl class which uses Bayesian unfolding to reconstruct the truth distribution.
 <p>Works for 2 and 3 dimensional distributions
 <p>Returned errors can be either as a diagonal matrix or as a full matrix of covariances
 <p>Regularisation parameter sets the number of iterations used in the unfolding (default=4)
 <p>Is able to account for bin migration and smearing
 <p>Can unfold if test and measured distributions have different binning.
 <p>Returns covariance matrices with conditions approximately that of the machine precision. This occasionally leads to very large chi squared values
-END_HTML */
+*/
 
 /////////////////////////////////////////////////////////////
 
 //#define OLDERRS   // restore old (incorrect) error calculation
+//#define OLDERRS2  // restore old (incorrect) systematic error calculation
+//#define OLDMULT   // restore old (slower) matrix multiplications
 
-#include "../include/RooUnfoldBayes.h"
+#include "RooUnfoldBayes.h"
 
 #include <iostream>
 #include <iomanip>
@@ -34,7 +36,7 @@ END_HTML */
 #include "TH1.h"
 #include "TH2.h"
 
-#include "../include/RooUnfoldResponse.h"
+#include "RooUnfoldResponse.h"
 
 using std::min;
 using std::cerr;
@@ -49,7 +51,7 @@ ClassImp (RooUnfoldBayes);
 RooUnfoldBayes::RooUnfoldBayes (const RooUnfoldBayes& rhs)
   : RooUnfold (rhs)
 {
-  // Copy constructor.
+  //! Copy constructor.
   Init();
   CopyData (rhs);
 }
@@ -58,14 +60,14 @@ RooUnfoldBayes::RooUnfoldBayes (const RooUnfoldResponse* res, const TH1* meas, I
                                 const char* name, const char* title)
   : RooUnfold (res, meas, name, title), _niter(niter), _smoothit(smoothit)
 {
-  // Constructor with response matrix object and measured unfolding input histogram.
-  // The regularisation parameter is niter (number of iterations).
+  //! Constructor with response matrix object and measured unfolding input histogram.
+  //! The regularisation parameter is niter (number of iterations).
   Init();
 }
 
 RooUnfoldBayes* RooUnfoldBayes::Clone (const char* newname) const
 {
-  // Creates a copy of the RooUnfoldBayes object
+  //! Creates a copy of the RooUnfoldBayes object
   RooUnfoldBayes* unfold= new RooUnfoldBayes(*this);
   if (newname && strlen(newname)) unfold->SetName(newname);
   return unfold;
@@ -74,6 +76,7 @@ RooUnfoldBayes* RooUnfoldBayes::Clone (const char* newname) const
 void RooUnfoldBayes::Init()
 {
   _nc= _ne= 0;
+  _nbartrue= _N0C= 0.0;
   GetSettings();
 }
 
@@ -98,9 +101,12 @@ void RooUnfoldBayes::CopyData (const RooUnfoldBayes& rhs)
 void RooUnfoldBayes::Unfold()
 {
   setup();
-  if (verbose() >= 2) Print();
+  if (verbose() >= 2) {
+    Print();
+    RooUnfoldResponse::PrintMatrix(_Nji,"RooUnfoldBayes response matrix (Nji)");
+  }
   if (verbose() >= 1) cout << "Now unfolding..." << endl;
-  train();
+  unfold();
   if (verbose() >= 2) Print();
   _rec.ResizeTo(_nc);
   _rec = _nbarCi;
@@ -126,7 +132,7 @@ void RooUnfoldBayes::GetSettings()
 
 TMatrixD& RooUnfoldBayes::H2M (const TH2* h, TMatrixD& m, Bool_t overflow)
 {
-  // TH2 -> TMatrixD
+  //! TH2 -> TMatrixD
   if (!h) return m;
   Int_t first= overflow ? 0 : 1;
   Int_t nm= m.GetNrows(), nt= m.GetNcols();
@@ -165,21 +171,27 @@ void RooUnfoldBayes::setup()
   _nbarCi.ResizeTo(_nc);
   _efficiencyCi.ResizeTo(_nc);
   _Mij.ResizeTo(_nc,_ne);
-  _dnCidnEj.ResizeTo(_nc,_ne);
+  _P0C.ResizeTo(_nc);
+  _UjInv.ResizeTo(_ne);
+#ifndef OLDERRS
+  if (_dosys!=2) _dnCidnEj.ResizeTo(_nc,_ne);
+#endif
+  if (_dosys)    _dnCidPjk.ResizeTo(_nc,_ne*_nc);
+
+  // Initial distribution
+  _N0C= _nCi.Sum();
+  if (_N0C!=0.0) {
+    _P0C= _nCi;
+    _P0C *= 1.0/_N0C;
+  }
 }
 
 //-------------------------------------------------------------------------
-void RooUnfoldBayes::train()
+void RooUnfoldBayes::unfold()
 {
-  // After accumulating the training sample, calculate the unfolding matrix.
-  // _niter = number of iterations to perform (3 by default).
-  // _smoothit = smooth the matrix in between iterations (default false).
-
-  Double_t ntrue = _nCi.Sum();
-
-  // Initial distribution
-  TVectorD P0C(_nCi);
-  P0C *= 1.0/ntrue;
+  //! Calculate the unfolding matrix.
+  //! _niter = number of iterations to perform (3 by default).
+  //! _smoothit = smooth the matrix in between iterations (default false).
 
   TMatrixD PEjCi(_ne,_nc), PEjCiEff(_ne,_nc);
   for (Int_t i = 0 ; i < _nc ; i++) {
@@ -195,16 +207,23 @@ void RooUnfoldBayes::train()
     for (Int_t j = 0 ; j < _ne ; j++) PEjCiEff(j,i) *= effinv;
   }
 
+  TVectorD PbarCi(_nc);
+
   for (Int_t kiter = 0 ; kiter < _niter; kiter++) {
 
     if (verbose()>=1) cout << "Iteration : " << kiter << endl;
 
-    TVectorD UjInv(_ne);
+    // update prior from previous iteration
+    if (kiter>0) {
+      _P0C = PbarCi;
+      _N0C = _nbartrue;
+    }
+
     for (Int_t j = 0 ; j < _ne ; j++) {
       Double_t Uj = 0.0;
       for (Int_t i = 0 ; i < _nc ; i++)
-        Uj += PEjCi(j,i) * P0C[i];
-      UjInv[j] = Uj > 0.0 ? 1.0/Uj : 0.0;
+        Uj += PEjCi(j,i) * _P0C[i];
+      _UjInv[j] = Uj > 0.0 ? 1.0/Uj : 0.0;
     }
 
     // Unfolding matrix M
@@ -212,7 +231,7 @@ void RooUnfoldBayes::train()
     for (Int_t i = 0 ; i < _nc ; i++) {
       Double_t nbarC = 0.0;
       for (Int_t j = 0 ; j < _ne ; j++) {
-        Double_t Mij = UjInv[j] * PEjCiEff(j,i) * P0C[i];
+        Double_t Mij = _UjInv[j] * PEjCiEff(j,i) * _P0C[i];
         _Mij(i,j) = Mij;
         nbarC += Mij * _nEstj[j];
       }
@@ -221,147 +240,154 @@ void RooUnfoldBayes::train()
     }
 
     // new estimate of true distribution
-    TVectorD PbarCi(_nbarCi);
+    PbarCi= _nbarCi;
     PbarCi *= 1.0/_nbartrue;
 
 #ifndef OLDERRS
-    if (kiter <= 0) {
-      _dnCidnEj= _Mij;
-    } else {
-      TVectorD ksum(_ne);
-      for (Int_t j = 0 ; j < _ne ; j++) {
-        for (Int_t k = 0 ; k < _ne ; k++) {
-          Double_t sum = 0.0;
-          for (Int_t l = 0 ; l < _nc ; l++) {
-            if (P0C[l]>0.0) sum += _efficiencyCi[l]*_Mij(l,k)*_dnCidnEj(l,j)/P0C[l];
-          }
-          ksum[k]= sum;
-        }
+    if (_dosys!=2) {
+      if (kiter <= 0) {
+        _dnCidnEj= _Mij;
+      } else {
+#ifndef OLDMULT
+        TVectorD en(_nc), nr(_nc);
         for (Int_t i = 0 ; i < _nc ; i++) {
-          Double_t dsum = P0C[i]>0 ? _dnCidnEj(i,j)*_nbarCi[i]/P0C[i] : 0.0;
-          for (Int_t k = 0 ; k < _ne ; k++) {
-            dsum -= _Mij(i,k)*_nEstj[k]*ksum[k];
-          }
-          // update dnCidnEj. Note that we can do this in-place due to the ordering of the accesses.
-          _dnCidnEj(i,j) = _Mij(i,j) + dsum/ntrue;
+          if (_P0C[i]<=0.0) continue;
+          Double_t ni= 1.0/(_N0C*_P0C[i]);
+          en[i]= -ni*_efficiencyCi[i];
+          nr[i]=  ni*_nbarCi[i];
         }
+        TMatrixD M1= _dnCidnEj;
+        M1.NormByColumn(nr,"M");
+        TMatrixD M2 (TMatrixD::kTransposed, _Mij);
+        M2.NormByColumn(_nEstj,"M");
+        M2.NormByRow(en,"M");
+        TMatrixD M3 (M2, TMatrixD::kMult, _dnCidnEj);
+        _dnCidnEj.Mult (_Mij, M3);
+        _dnCidnEj += _Mij;
+        _dnCidnEj += M1;
+#else /* OLDMULT */
+        TVectorD ksum(_ne);
+        for (Int_t j = 0 ; j < _ne ; j++) {
+          for (Int_t k = 0 ; k < _ne ; k++) {
+            Double_t sum = 0.0;
+            for (Int_t l = 0 ; l < _nc ; l++) {
+              if (_P0C[l]>0.0) sum += _efficiencyCi[l]*_Mij(l,k)*_dnCidnEj(l,j)/_P0C[l];
+            }
+            ksum[k]= sum;
+          }
+          for (Int_t i = 0 ; i < _nc ; i++) {
+            Double_t dsum = _P0C[i]>0 ? _dnCidnEj(i,j)*_nbarCi[i]/_P0C[i] : 0.0;
+            for (Int_t k = 0 ; k < _ne ; k++) {
+              dsum -= _Mij(i,k)*_nEstj[k]*ksum[k];
+            }
+            // update dnCidnEj. Note that we can do this in-place due to the ordering of the accesses.
+            _dnCidnEj(i,j) = _Mij(i,j) + dsum/_N0C;
+          }
+        }
+#endif
       }
     }
 #endif
+
+    if (_dosys) {
+#ifndef OLDERRS2
+      if (kiter > 0) {
+        TVectorD mbyu(_ne);
+        for (Int_t j = 0 ; j < _ne ; j++) {
+          mbyu[j]= _UjInv[j]*_nEstj[j]/_N0C;
+        }
+        TMatrixD A= _Mij;
+        A.NormByRow (mbyu, "M");
+        TMatrixD B(A, TMatrixD::kMult, PEjCi);
+        TMatrixD dnCidPjkUpd (B, TMatrixD::kMult, _dnCidPjk);
+        Int_t nec= _ne*_nc;
+        for (Int_t i = 0 ; i < _nc ; i++) {
+          if (_P0C[i]<=0.0) continue;  // skip loop: dnCidPjkUpd(i,jk) will also be 0 because _Mij(i,j) will be 0
+          Double_t r= PbarCi[i]/_P0C[i];
+          for (Int_t jk= 0; jk<nec; jk++)
+            _dnCidPjk(i,jk)= r*_dnCidPjk(i,jk) - dnCidPjkUpd(i,jk);
+        }
+      }
+#else  /* OLDERRS2 */
+      if (kiter == _niter-1)   // used to only calculate _dnCidPjk for the final iteration
+#endif
+      for (Int_t j = 0 ; j < _ne ; j++) {
+        if (_UjInv[j]==0.0) continue;
+        Double_t mbyu= _UjInv[j]*_nEstj[j];
+        Int_t j0= j*_nc;
+        for (Int_t i = 0 ; i < _nc ; i++) {
+          Double_t b= -mbyu * _Mij(i,j);
+          for (Int_t k = 0 ; k < _nc ; k++) _dnCidPjk(i,j0+k) += b*_P0C[k];
+          if (_efficiencyCi[i]!=0.0)
+            _dnCidPjk(i,j0+i) += (_P0C[i]*mbyu - _nbarCi[i]) / _efficiencyCi[i];
+        }
+      }
+    }
 
     // no need to smooth the last iteraction
     if (_smoothit && kiter < (_niter-1)) smooth(PbarCi);
 
     // Chi2 based on Poisson errors
-    Double_t chi2 = getChi2(PbarCi, P0C, _nbartrue);
+    Double_t chi2 = getChi2(PbarCi, _P0C, _nbartrue);
     if (verbose()>=1) cout << "Chi^2 of change " << chi2 << endl;
-
-    // replace P0C
-    P0C = PbarCi;
-    ntrue = _nbartrue;
 
     // and repeat
   }
 }
 
 //-------------------------------------------------------------------------
-void RooUnfoldBayes::getCovariance(Bool_t doUnfoldSystematic)
+void RooUnfoldBayes::getCovariance()
 {
-  if (verbose()>=1) cout << "Calculating covariances due to number of measured events" << endl;
+  if (_dosys!=2) {
+    if (verbose()>=1) cout << "Calculating covariances due to number of measured events" << endl;
 
-  // Create the covariance matrix of result from that of the measured distribution
-  _cov.ResizeTo (_nc, _nc);
+    //! Create the covariance matrix of result from that of the measured distribution
+    _cov.ResizeTo (_nc, _nc);
 #ifdef OLDERRS
-  ABAT (_Mij,      GetMeasuredCov(), _cov);
+    const TMatrixD& Dprop= _Mij;
 #else
-  ABAT (_dnCidnEj, GetMeasuredCov(), _cov);
+    const TMatrixD& Dprop= _dnCidnEj;
 #endif
-
-  // error due to uncertainty on unfolding matrix M
-  // This is disabled by default: I'm not sure it is correct, it is very slow, and
-  // the effect should be small with good MC statistics.
-  if (!doUnfoldSystematic) return;
-
-  if (verbose()>=0 && _nc*_ne >= 50625)
-    cout << "getCovariance (this takes some time with " << _nc << " x " << _ne << " bins)." << endl;
-
-  if (verbose()>=1) cout << "Calculating covariance due to unfolding matrix..." << endl;
-
-  // Pre-compute some numbers
-  TVectorD inv_nCi(_nCi);
-  TMatrixD inv_npec(_nc,_ne);  // automatically zeroed
-  for (Int_t k = 0 ; k < _nc ; k++) {
-    if (inv_nCi[k] != 0) {inv_nCi[k] = 1.0 / inv_nCi[k];}
-    for (Int_t i = 0 ; i < _ne ; i++) {
-      if (inv_nCi[k] == 0) continue;
-      Double_t pec  = _Nji(i,k) / _nCi[k];
-      Double_t temp = inv_nCi[k] / pec;
-      if (pec !=0) {inv_npec(k,i) = temp; }
+    if (_haveCovMes) {
+      ABAT (Dprop, GetMeasuredCov(), _cov);
+    } else {
+      TVectorD v= Emeasured();
+      v.Sqr();
+      ABAT (Dprop, v, _cov);
     }
   }
-  //
-  TMatrixD M_tmp(_nc,_ne);  // automatically zeroed
-  for (Int_t i = 0 ; i < _ne ; i++) {
-    Double_t temp = 0.0;
-    // diagonal element
-    for (Int_t u = 0 ; u < _nc ; u++) {
-      temp = _Mij(i,u) * _Mij(i,u) * _efficiencyCi[u] * _efficiencyCi[u]
-        * (inv_npec(u,i) - inv_nCi[u]);
-      M_tmp(i, i) += temp;
-    }
 
-    // off-diagonal element
-    for (Int_t j = i+1 ; j < _ne ; j++) {
-      for (Int_t u = 0 ; u < _nc ; u++) {
-        temp = -1.0 * _Mij(i,u) * _Mij(j,u) * _efficiencyCi[u] * _efficiencyCi[u]
-          * inv_nCi[u];
-        M_tmp(j, i) += temp;
+  if (_dosys) {
+    if (verbose()>=1) cout << "Calculating covariance due to unfolding matrix..." << endl;
+
+    const TMatrixD& Eres= _res->Eresponse();
+    TVectorD Vjk(_ne*_nc);           // vec(Var(j,k))
+    for (Int_t j = 0 ; j < _ne ; j++) {
+      Int_t j0= j*_nc;
+      for (Int_t i = 0 ; i < _nc ; i++) {
+        Double_t e= Eres(j,i);
+        Vjk[j0+i]= e*e;
       }
-      M_tmp(i, j) =  M_tmp(j, i); // symmetric matrix
+    }
+
+    if (_dosys!=2) {
+      TMatrixD covres(_nc,_nc);
+      ABAT (_dnCidPjk, Vjk, covres);
+      _cov += covres;
+    } else {
+      _cov.ResizeTo (_nc, _nc);
+      ABAT (_dnCidPjk, Vjk, _cov);
     }
   }
-
-  // now calculate covariance
-  TMatrixD Vc1(_nc,_nc);
-  Double_t neff_inv = 0.0;
-  for (Int_t k = 0 ; k < _nc ; k++) {
-    (_efficiencyCi[k] != 0) ? neff_inv = inv_nCi[k]  / _efficiencyCi[k] : neff_inv = 0;
-    for (Int_t l = k ; l < _nc ; l++) {
-      for (Int_t i = 0 ; i < _ne ; i++) {
-        for (Int_t j = 0 ; j < _ne ; j++) {
-          Double_t covM = _Mij(i,l) * inv_nCi[l] +
-            _Mij(j,k) * inv_nCi[k] + M_tmp(j,i);
-          if (k==l) {
-            covM -= neff_inv;
-            if (i==j) {covM += inv_npec(k,i);}
-          }
-          if (i==j) {
-            covM -=  (_Mij(i,l) * _efficiencyCi[l] * inv_npec(l,i) +
-                      _Mij(i,k) * _efficiencyCi[k] * inv_npec(k,i) );
-          }
-          covM +=  _Mij(i,k) * _Mij(j,l);
-
-          Double_t temp = _nEstj[i] * _nEstj[j] * covM;
-          Vc1(l, k) += temp;
-        } // j...
-      } // i...
-      Vc1(k, l) =  Vc1(l,k);
-    } // l...
-  } // k...
-
-    // to get complete covariance add together
-  Vc1 *= 1.0/(_nbartrue*_nbartrue);  // divide by _nbartrue*_nbartrue to get probability covariance matrix
-  _cov += Vc1;
-
 }
 
 //-------------------------------------------------------------------------
 void RooUnfoldBayes::smooth(TVectorD& PbarCi) const
 {
-  // Smooth unfolding distribution. PbarCi is the array of proababilities
-  // to be smoothed PbarCi; nevts is the numbers of events
-  // (needed to calculate suitable errors for the smearing).
-  // PbarCi is returned with the smoothed distribution.
+  //! Smooth unfolding distribution. PbarCi is the array of proababilities
+  //! to be smoothed PbarCi; nevts is the numbers of events
+  //! (needed to calculate suitable errors for the smearing).
+  //! PbarCi is returned with the smoothed distribution.
 
   if (_res->GetDimensionTruth() != 1) {
     cerr << "Smoothing only implemented for 1-D distributions" << endl;
@@ -377,8 +403,8 @@ Double_t RooUnfoldBayes::getChi2(const TVectorD& prob1,
                                  const TVectorD& prob2,
                                  Double_t nevents) const
 {
-  // calculate the chi^2. prob1 and prob2 are the probabilities
-  // and nevents is the number of events used to calculate the probabilities
+  //! calculate the chi^2. prob1 and prob2 are the probabilities
+  //! and nevents is the number of events used to calculate the probabilities
   Double_t chi2= 0.0;
   Int_t n= prob1.GetNrows();
   if (verbose()>=2) cout << "chi2 " << n << " " << nevents << endl;
@@ -400,14 +426,13 @@ void RooUnfoldBayes::Print(Option_t* option) const
   RooUnfold::Print (option);
   if (_nc<=0 || _ne<=0) return;
 
-  // Print out some useful info of progress so far
+  //! Print out some useful info of progress so far
 
   cout << "-------------------------------------------" << endl;
   cout << "Unfolding Algorithm" << endl;
   cout << "Generated (Training):" << endl;
   cout << "  Total Number of bins   : " << _nc << endl;
-  Double_t ntrue = _nCi.Sum();
-  cout << "  Total Number of events : " << ntrue << endl;
+  cout << "  Total Number of events : " << _nCi.Sum() << endl;
 
   cout << "Measured (Training):" << endl;
   cout << "  Total Number of bins   : " << _ne << endl;
@@ -424,10 +449,7 @@ void RooUnfoldBayes::Print(Option_t* option) const
     Int_t iend = min(_nCi.GetNrows(),_nEstj.GetNrows());
     cout << "    \tTrain \tTest\tUnfolded"<< endl;
     cout << "Bin \tTruth \tInput\tOutput"<< endl;
-    Int_t ir=0, ic=0;
     for (Int_t i=0; i < iend ; i++) {
-      ic = i / _ne;
-      ir = i - (ic*_ne);
       if ((_nCi[i] == 0) && (_nEstj[i] == 0) &&
           (_nEstj[i] == 0) && (_nbarCi[i]==0)) continue;
       cout << i << "\t" << _nCi[i]                                      \
